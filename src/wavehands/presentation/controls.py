@@ -287,6 +287,10 @@ class ControlPanel:
     def consume_record_stop(self) -> bool:
         return self.record_stop_button.consume_click()
 
+    def consume_clear_loop(self) -> bool:
+        # Compatibilidad con controladores que usan el flujo "Clear Loop".
+        return self.record_stop_button.consume_click()
+
     def set_record_state(self, state: str) -> None:
         self._record_state = state
         if state == "recording":

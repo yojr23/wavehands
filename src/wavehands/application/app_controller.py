@@ -1,6 +1,7 @@
 import time
 import ctypes
 import platform
+from pathlib import Path
 from typing import Optional, Tuple
 
 import cv2
@@ -22,8 +23,7 @@ from wavehands.infrastructure.audio.mono_synth import MonoSynthEngine
 from wavehands.infrastructure.camera import CameraStream
 from wavehands.infrastructure.hand_tracker import MediaPipeHandTracker
 from wavehands.presentation.controls import ControlPanel
-from wavehands.presentation.gesture_pedals import GesturePedal
-from wavehands.presentation.note_wheel import NoteWheel
+from wavehands.presentation.note_wheel import NoteWheel, WheelPalette
 from wavehands.presentation.renderer import draw_status
 from wavehands.utils.metrics import RuntimeMetrics, configure_logging
 
@@ -46,8 +46,21 @@ class WaveHandsApp:
         self.loop_station = LoopStationService()
         self.synth = MonoSynthEngine(self.config.audio)
 
-        self.note_wheel = NoteWheel(Point2D(0, 0), 100, NOTE_NAMES)
-        self.chord_wheel = NoteWheel(Point2D(0, 0), 80, CHORD_NAMES)
+        note_palette = WheelPalette(
+            selected_fill=(33, 190, 236),
+            hover_fill=(22, 122, 171),
+            pulse=(255, 228, 120),
+            center_fill=(22, 40, 55),
+        )
+        chord_palette = WheelPalette(
+            selected_fill=(190, 93, 233),
+            hover_fill=(130, 72, 165),
+            pointer_ring=(194, 110, 230),
+            pulse=(255, 170, 238),
+            center_fill=(46, 24, 54),
+        )
+        self.note_wheel = NoteWheel(Point2D(0, 0), 100, NOTE_NAMES, palette=note_palette)
+        self.chord_wheel = NoteWheel(Point2D(0, 0), 80, CHORD_NAMES, palette=chord_palette)
 
         self.base_frame_w = self.config.camera.width
         self.base_frame_h = self.config.camera.height
@@ -57,26 +70,20 @@ class WaveHandsApp:
 
         self.controls = ControlPanel(panel_x=self.base_frame_w, panel_width=self.config.ui.panel_width)
 
-        self.sustain_pedal = GesturePedal(
-            center=Point2D(x=0, y=0),
-            radius=40,
-            label="Pedal Sustain",
-        )
-        self.loop_pedal = GesturePedal(
-            center=Point2D(x=0, y=0),
-            radius=40,
-            label="Pedal Loop",
-        )
-
         self._last_time = time.time()
         self._last_trigger_signature: Optional[Tuple[int, int, int, bool]] = None
         self._previous_sustain = False
         self._note_pulse_started_at = 0.0
+        self._chord_pulse_started_at = 0.0
         self._canvas = np.zeros((self.window_h, self.window_w, 3), dtype=np.uint8)
         self._last_layout_signature: Optional[tuple[int, int, int]] = None
         self._window_query_period_frames = 5
         self._frame_counter = 0
         self._last_volume_revision = self.controls.volume_revision
+        self._record_state = "idle"
+        self._record_writer: Optional[cv2.VideoWriter] = None
+        self._record_temp_path: Optional[Path] = None
+        self._record_fps = 30.0
         self.metrics = RuntimeMetrics(interval_seconds=self.config.metrics.log_interval_seconds)
 
         cv2.namedWindow(self.WINDOW_NAME, cv2.WINDOW_NORMAL | cv2.WINDOW_FREERATIO)
@@ -88,6 +95,7 @@ class WaveHandsApp:
         cv2.setMouseCallback(self.WINDOW_NAME, self.controls.on_mouse)
         self._is_fullscreen = True
         self.synth.set_volume(self.controls.volume_slider.value)
+        self.controls.set_record_state(self._record_state)
 
     def run(self) -> None:
         try:
@@ -125,20 +133,8 @@ class WaveHandsApp:
                 if volume_revision != self._last_volume_revision:
                     self._last_volume_revision = volume_revision
                     self.synth.set_volume(settings.volume)
-
-                sustain_pointer = self._find_pointer_in_pedal(tracker_result.pointers, self.sustain_pedal)
-                if self.sustain_pedal.update(sustain_pointer, now):
-                    self.controls.set_sustain(not settings.sustain)
-                    settings = self.controls.to_settings()
-                    self.metrics.counters.sustain_toggles += 1
-
-                loop_pointer = self._find_pointer_in_pedal(tracker_result.pointers, self.loop_pedal)
-                if self.loop_pedal.update(loop_pointer, now):
-                    self.loop_station.cycle(now)
-                    self.metrics.counters.loop_state_changes += 1
-
-                if self.controls.consume_clear_loop():
-                    self.loop_station.clear()
+                record_toggle_requested = self.controls.consume_record_toggle()
+                record_stop_requested = self.controls.consume_record_stop()
 
                 if self._previous_sustain and not settings.sustain:
                     self.synth.stop_note()
@@ -192,6 +188,7 @@ class WaveHandsApp:
                         settings.sustain,
                     )
                     self.metrics.counters.chord_changes += 1
+                    self._chord_pulse_started_at = now
 
                 # Si sustain esta activo y cambian parametros de rango, se actualiza sin esperar nueva seleccion.
                 if settings.sustain and selected_note_index is not None:
@@ -245,13 +242,17 @@ class WaveHandsApp:
                     hovered_index=self.chord_selector.state.hovered_index,
                     selected_index=self.chord_selector.state.selected_index,
                     hover_progress=chord_hover_progress,
-                    pulse_strength=0.0,
+                    pulse_strength=self._chord_pulse_strength(now),
                     pointer_inside=pointer_inside_chord_wheel,
                 )
                 panel_x = camera_w
                 self.controls.draw(canvas, panel_x)
-                self.sustain_pedal.draw(canvas, now, "ON" if settings.sustain else "OFF")
-                self.loop_pedal.draw(canvas, now, self.loop_station.state.mode.upper())
+                if record_toggle_requested:
+                    self._toggle_recording(self.window_w, self.window_h)
+                if record_stop_requested:
+                    self._stop_recording(prompt_name=True)
+                if self._record_state == "recording":
+                    self._write_record_frame(canvas)
 
                 selected_note = note_name_from_index(selected_note_index) if selected_note_index is not None else None
                 selected_chord = chord_name_from_index(selected_chord_index) if selected_chord_index is not None else None
@@ -261,6 +262,7 @@ class WaveHandsApp:
                     else None
                 )
                 interaction_mode = "2 manos" if len(tracker_result.pointers) >= 2 else "1 mano"
+                interaction_mode = f"{interaction_mode} | REC:{self._record_state}"
 
                 draw_status(
                     canvas,
@@ -290,6 +292,7 @@ class WaveHandsApp:
                 if key == ord("f"):
                     self._toggle_fullscreen()
         finally:
+            self._stop_recording(prompt_name=False)
             self.synth.close()
             self.tracker.close()
             self.camera.release()
@@ -316,16 +319,18 @@ class WaveHandsApp:
         hover_elapsed = now - selector.state.hover_started_at
         return max(0.0, min(1.0, hover_elapsed / self.config.selection.hover_seconds))
 
-    def _find_pointer_in_pedal(self, pointers: list[HandPointer], pedal: GesturePedal) -> Optional[Point2D]:
-        for pointer in pointers:
-            if (pointer.point.x - pedal.center.x) ** 2 + (pointer.point.y - pedal.center.y) ** 2 <= pedal.radius ** 2:
-                return pointer.point
-        return None
-
     def _note_pulse_strength(self, now: float) -> float:
         if self._note_pulse_started_at == 0.0:
             return 0.0
         age = now - self._note_pulse_started_at
+        if age > 0.4:
+            return 0.0
+        return 1.0 - (age / 0.4)
+
+    def _chord_pulse_strength(self, now: float) -> float:
+        if self._chord_pulse_started_at == 0.0:
+            return 0.0
+        age = now - self._chord_pulse_started_at
         if age > 0.4:
             return 0.0
         return 1.0 - (age / 0.4)
@@ -365,11 +370,6 @@ class WaveHandsApp:
             self.note_wheel.set_geometry(note_center, note_radius)
 
         self.chord_wheel.set_geometry(chord_center, chord_radius)
-
-        pedal_radius = max(26, int(min(camera_w, camera_h) * 0.07))
-        pedal_y = int(camera_h * 0.88)
-        self.sustain_pedal.set_geometry(Point2D(x=int(camera_w * 0.16), y=pedal_y), pedal_radius)
-        self.loop_pedal.set_geometry(Point2D(x=int(camera_w * 0.34), y=pedal_y), pedal_radius)
 
         panel_x = camera_w
         self.controls.layout(panel_x=panel_x, panel_width=panel_w, canvas_height=camera_h)
@@ -416,3 +416,76 @@ class WaveHandsApp:
             except Exception:
                 pass
         return self.window_w, self.window_h
+
+    def _toggle_recording(self, width: int, height: int) -> None:
+        if self._record_state == "idle":
+            self._start_recording(width, height)
+            return
+        if self._record_state == "recording":
+            self._record_state = "paused"
+            self.controls.set_record_state(self._record_state)
+            return
+        if self._record_state == "paused":
+            self._record_state = "recording"
+            self.controls.set_record_state(self._record_state)
+
+    def _start_recording(self, width: int, height: int) -> None:
+        downloads = Path.home() / "Downloads"
+        downloads.mkdir(parents=True, exist_ok=True)
+        temp_path = downloads / f"wavehands_tmp_{int(time.time())}.mp4"
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(temp_path), fourcc, self._record_fps, (int(width), int(height)))
+        if not writer.isOpened():
+            return
+        self._record_writer = writer
+        self._record_temp_path = temp_path
+        self._record_state = "recording"
+        self.controls.set_record_state(self._record_state)
+
+    def _stop_recording(self, prompt_name: bool) -> None:
+        if self._record_writer is None:
+            self._record_state = "idle"
+            self.controls.set_record_state(self._record_state)
+            return
+        self._record_writer.release()
+        self._record_writer = None
+
+        temp_path = self._record_temp_path
+        self._record_temp_path = None
+        self._record_state = "idle"
+        self.controls.set_record_state(self._record_state)
+        if temp_path is None or not temp_path.exists():
+            return
+
+        name = ""
+        if prompt_name:
+            try:
+                name = input("\nNombre para guardar el video (sin .mp4): ").strip()
+            except EOFError:
+                name = ""
+        if not name:
+            name = f"wavehands_take_{time.strftime('%Y%m%d_%H%M%S')}"
+
+        safe_name = "".join(ch for ch in name if ch.isalnum() or ch in ("_", "-", " ")).strip().replace(" ", "_")
+        if not safe_name:
+            safe_name = f"wavehands_take_{int(time.time())}"
+
+        final_path = temp_path.with_name(f"{safe_name}.mp4")
+        idx = 1
+        while final_path.exists():
+            final_path = temp_path.with_name(f"{safe_name}_{idx}.mp4")
+            idx += 1
+
+        try:
+            temp_path.replace(final_path)
+            print(f"[WaveHands] Video guardado en: {final_path}")
+        except OSError:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _write_record_frame(self, frame: np.ndarray) -> None:
+        if self._record_writer is None:
+            return
+        self._record_writer.write(frame)
