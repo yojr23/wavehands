@@ -16,6 +16,7 @@ class HandTrackerConfig:
     min_tracking_confidence: float = 0.6
     inference_width: int = 256
     draw_landmarks: bool = False
+    pinch_threshold_ratio: float = 0.38
 
 
 @dataclass(frozen=True)

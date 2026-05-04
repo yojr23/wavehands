@@ -1,7 +1,9 @@
 import ctypes
 import queue
 import time
+import wave
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -53,6 +55,9 @@ class MonoSynthEngine:
         self._loop_velocities = np.zeros(0, dtype=np.float64)
         self._note_off_at_perf: Optional[float] = None
         self._control_queue: queue.SimpleQueue[tuple[str, tuple]] = queue.SimpleQueue()
+        self._record_capture_active = False
+        self._record_capture_paused = False
+        self._record_chunks: list[np.ndarray] = []
 
         self._stream = sd.OutputStream(
             channels=1,
@@ -109,6 +114,39 @@ class MonoSynthEngine:
     def close(self) -> None:
         self._stream.stop()
         self._stream.close()
+
+    def start_record_capture(self) -> None:
+        self._record_chunks = []
+        self._record_capture_paused = False
+        self._record_capture_active = True
+
+    def pause_record_capture(self) -> None:
+        if self._record_capture_active:
+            self._record_capture_paused = True
+
+    def resume_record_capture(self) -> None:
+        if self._record_capture_active:
+            self._record_capture_paused = False
+
+    def stop_record_capture(self, wav_path: Path) -> bool:
+        self._record_capture_active = False
+        self._record_capture_paused = False
+        if not self._record_chunks:
+            return False
+
+        try:
+            audio = np.concatenate(self._record_chunks, axis=0)
+            np.clip(audio, -1.0, 1.0, out=audio)
+            pcm = (audio * 32767.0).astype(np.int16)
+            wav_path.parent.mkdir(parents=True, exist_ok=True)
+            with wave.open(str(wav_path), "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(self._sample_rate)
+                wav_file.writeframes(pcm.tobytes())
+            return True
+        finally:
+            self._record_chunks = []
 
     def metrics_snapshot(self) -> dict[str, float]:
         return {
@@ -267,6 +305,8 @@ class MonoSynthEngine:
         self._callback_cpu_avg = (self._callback_cpu_avg * 0.98) + (cpu_ratio * 0.02)
 
         outdata[:, 0] = output
+        if self._record_capture_active and not self._record_capture_paused:
+            self._record_chunks.append(np.copy(output))
 
     def _ensure_audio_buffers(self, frames: int, voices: int) -> None:
         if self._output_buffer.shape[0] < frames:

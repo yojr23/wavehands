@@ -54,7 +54,10 @@ python app.py
 - Grabacion de video en panel derecho:
   - `Grabar` inicia
   - `Pausar/Reanudar` alterna durante la toma
-  - `Detener` cierra la toma y pregunta en terminal con que nombre guardar el `.mp4` en `~/Downloads`.
+  - `Detener` cierra la toma y abre un cuadro dentro de la app para escribir el nombre.
+- Exportacion con audio:
+  - Si `ffmpeg` esta instalado, se guarda un `.mp4` con audio integrado.
+  - Si `ffmpeg` no esta instalado, se guarda el `.mp4` de video y un `.wav` separado en `~/Downloads`.
 - La ventana ahora es responsive: puedes redimensionarla y la UI se adapta (con mapeo correcto de mouse).
 
 ## Arquitectura

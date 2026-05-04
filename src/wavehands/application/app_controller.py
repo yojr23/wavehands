@@ -1,6 +1,8 @@
 import time
 import ctypes
 import platform
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -83,7 +85,12 @@ class WaveHandsApp:
         self._record_state = "idle"
         self._record_writer: Optional[cv2.VideoWriter] = None
         self._record_temp_path: Optional[Path] = None
+        self._record_temp_audio_path: Optional[Path] = None
         self._record_fps = 30.0
+        self._naming_active = False
+        self._name_input_buffer = ""
+        self._pending_save_temp_path: Optional[Path] = None
+        self._pending_save_audio_path: Optional[Path] = None
         self.metrics = RuntimeMetrics(interval_seconds=self.config.metrics.log_interval_seconds)
 
         cv2.namedWindow(self.WINDOW_NAME, cv2.WINDOW_NORMAL | cv2.WINDOW_FREERATIO)
@@ -277,6 +284,9 @@ class WaveHandsApp:
                     loop_layers=len(self.loop_station.state.layers),
                 )
 
+                if self._naming_active:
+                    self._draw_name_prompt(canvas)
+
                 if self.config.metrics.enabled:
                     self.metrics.maybe_log(
                         selected_note=selected_note,
@@ -287,12 +297,18 @@ class WaveHandsApp:
 
                 cv2.imshow(self.WINDOW_NAME, canvas)
                 key = cv2.waitKey(1) & 0xFF
+
+                if self._naming_active:
+                    self._handle_name_prompt_key(key)
+                    continue
+
                 if key in (27, ord("q")):
                     break
                 if key == ord("f"):
                     self._toggle_fullscreen()
         finally:
             self._stop_recording(prompt_name=False)
+            self._finalize_pending_recording_with_default_name()
             self.synth.close()
             self.tracker.close()
             self.camera.release()
@@ -423,22 +439,28 @@ class WaveHandsApp:
             return
         if self._record_state == "recording":
             self._record_state = "paused"
+            self.synth.pause_record_capture()
             self.controls.set_record_state(self._record_state)
             return
         if self._record_state == "paused":
             self._record_state = "recording"
+            self.synth.resume_record_capture()
             self.controls.set_record_state(self._record_state)
 
     def _start_recording(self, width: int, height: int) -> None:
         downloads = Path.home() / "Downloads"
         downloads.mkdir(parents=True, exist_ok=True)
-        temp_path = downloads / f"wavehands_tmp_{int(time.time())}.mp4"
+        token = int(time.time())
+        temp_path = downloads / f"wavehands_tmp_{token}.mp4"
+        temp_audio_path = downloads / f"wavehands_tmp_{token}.wav"
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(str(temp_path), fourcc, self._record_fps, (int(width), int(height)))
         if not writer.isOpened():
             return
         self._record_writer = writer
         self._record_temp_path = temp_path
+        self._record_temp_audio_path = temp_audio_path
+        self.synth.start_record_capture()
         self._record_state = "recording"
         self.controls.set_record_state(self._record_state)
 
@@ -451,18 +473,129 @@ class WaveHandsApp:
         self._record_writer = None
 
         temp_path = self._record_temp_path
+        temp_audio_path = self._record_temp_audio_path
         self._record_temp_path = None
+        self._record_temp_audio_path = None
         self._record_state = "idle"
         self.controls.set_record_state(self._record_state)
         if temp_path is None or not temp_path.exists():
             return
 
-        name = ""
+        audio_path_to_save: Optional[Path] = None
+        if temp_audio_path is not None:
+            has_audio = self.synth.stop_record_capture(temp_audio_path)
+            if has_audio and temp_audio_path.exists():
+                audio_path_to_save = temp_audio_path
+            else:
+                try:
+                    temp_audio_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
         if prompt_name:
-            try:
-                name = input("\nNombre para guardar el video (sin .mp4): ").strip()
-            except EOFError:
-                name = ""
+            self._pending_save_temp_path = temp_path
+            self._pending_save_audio_path = audio_path_to_save
+            self._naming_active = True
+            self._name_input_buffer = ""
+            return
+
+        self._save_recorded_video(temp_path=temp_path, audio_path=audio_path_to_save, custom_name="")
+
+    def _write_record_frame(self, frame: np.ndarray) -> None:
+        if self._record_writer is None:
+            return
+        self._record_writer.write(frame)
+
+    def _draw_name_prompt(self, frame: np.ndarray) -> None:
+        h, w = frame.shape[:2]
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.55, frame, 0.45, 0.0, frame)
+
+        box_w = int(min(760, w * 0.7))
+        box_h = int(min(220, h * 0.35))
+        x1 = (w - box_w) // 2
+        y1 = (h - box_h) // 2
+        x2 = x1 + box_w
+        y2 = y1 + box_h
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (22, 35, 54), -1)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (128, 166, 199), 2)
+
+        cv2.putText(
+            frame,
+            "Nombre del video",
+            (x1 + 20, y1 + 42),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            (240, 247, 255),
+            2,
+        )
+        cv2.putText(
+            frame,
+            "Enter = Guardar   |   Esc = Nombre automatico",
+            (x1 + 20, y2 - 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (184, 211, 238),
+            1,
+        )
+
+        input_x1 = x1 + 20
+        input_y1 = y1 + 64
+        input_x2 = x2 - 20
+        input_y2 = y1 + 124
+        cv2.rectangle(frame, (input_x1, input_y1), (input_x2, input_y2), (12, 22, 36), -1)
+        cv2.rectangle(frame, (input_x1, input_y1), (input_x2, input_y2), (107, 146, 184), 1)
+
+        text = self._name_input_buffer if self._name_input_buffer else "wavehands_take_YYYYMMDD_HHMMSS"
+        color = (236, 246, 255) if self._name_input_buffer else (125, 147, 170)
+        cv2.putText(frame, text, (input_x1 + 12, input_y1 + 38), cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 1)
+
+    def _handle_name_prompt_key(self, key: int) -> None:
+        if key in (13, 10):
+            self._finalize_pending_recording_with_name(self._name_input_buffer.strip())
+            return
+        if key == 27:
+            self._finalize_pending_recording_with_name("")
+            return
+        if key in (8, 127):
+            self._name_input_buffer = self._name_input_buffer[:-1]
+            return
+        if 32 <= key <= 126:
+            if len(self._name_input_buffer) < 64:
+                self._name_input_buffer += chr(key)
+
+    def _finalize_pending_recording_with_name(self, name: str) -> None:
+        temp_path = self._pending_save_temp_path
+        audio_path = self._pending_save_audio_path
+        self._pending_save_temp_path = None
+        self._pending_save_audio_path = None
+        self._naming_active = False
+        self._name_input_buffer = ""
+        if temp_path is None:
+            return
+        self._save_recorded_video(temp_path=temp_path, audio_path=audio_path, custom_name=name)
+
+    def _finalize_pending_recording_with_default_name(self) -> None:
+        if self._pending_save_temp_path is None:
+            return
+        temp = self._pending_save_temp_path
+        audio = self._pending_save_audio_path
+        self._pending_save_temp_path = None
+        self._pending_save_audio_path = None
+        self._naming_active = False
+        self._name_input_buffer = ""
+        self._save_recorded_video(temp_path=temp, audio_path=audio, custom_name="")
+
+    def _save_recorded_video(self, temp_path: Path, audio_path: Optional[Path], custom_name: str) -> None:
+        if not temp_path.exists():
+            if audio_path is not None:
+                try:
+                    audio_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            return
+        name = custom_name.strip()
         if not name:
             name = f"wavehands_take_{time.strftime('%Y%m%d_%H%M%S')}"
 
@@ -476,16 +609,67 @@ class WaveHandsApp:
             final_path = temp_path.with_name(f"{safe_name}_{idx}.mp4")
             idx += 1
 
+        merged = False
+        if audio_path is not None and audio_path.exists():
+            merged = self._mux_audio_video(video_path=temp_path, audio_path=audio_path, output_path=final_path)
+            if merged:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                try:
+                    audio_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                print(f"[WaveHands] Video+audio guardado en: {final_path}")
+                return
+
         try:
             temp_path.replace(final_path)
             print(f"[WaveHands] Video guardado en: {final_path}")
+            if audio_path is not None and audio_path.exists():
+                wav_path = final_path.with_suffix(".wav")
+                wav_idx = 1
+                while wav_path.exists():
+                    wav_path = final_path.with_name(f"{final_path.stem}_{wav_idx}.wav")
+                    wav_idx += 1
+                audio_path.replace(wav_path)
+                print(f"[WaveHands] Audio separado guardado en: {wav_path}")
         except OSError:
             try:
                 temp_path.unlink(missing_ok=True)
             except OSError:
                 pass
+            if audio_path is not None:
+                try:
+                    audio_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
-    def _write_record_frame(self, frame: np.ndarray) -> None:
-        if self._record_writer is None:
-            return
-        self._record_writer.write(frame)
+    def _mux_audio_video(self, video_path: Path, audio_path: Path, output_path: Path) -> bool:
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if ffmpeg_bin is None:
+            print("[WaveHands] ffmpeg no encontrado. Se guardara video sin audio combinado.")
+            return False
+        command = [
+            ffmpeg_bin,
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            str(video_path),
+            "-i",
+            str(audio_path),
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(output_path),
+        ]
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode == 0 and output_path.exists():
+            return True
+        if result.stderr:
+            print(f"[WaveHands] ffmpeg error: {result.stderr.strip()}")
+        return False

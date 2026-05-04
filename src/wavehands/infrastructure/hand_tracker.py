@@ -1,5 +1,6 @@
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List
+import math
 
 import cv2
 import mediapipe as mp
@@ -49,15 +50,18 @@ class MediaPipeHandTracker:
         scale_x = out_w / float(inf_w)
         scale_y = out_h / float(inf_h)
         for idx, hand_lm in enumerate(result.multi_hand_landmarks):
-            tip = hand_lm.landmark[self._mp_hands.HandLandmark.INDEX_FINGER_TIP]
+            pinch_point = self._pinch_point_if_active(hand_lm, inf_w=inf_w, inf_h=inf_h)
+            if pinch_point is None:
+                continue
+
             point = Point2D(
-                x=int(tip.x * inf_w * scale_x),
-                y=int(tip.y * inf_h * scale_y),
+                x=int(pinch_point.x * scale_x),
+                y=int(pinch_point.y * scale_y),
             )
             hand_label = "Unknown"
             if result.multi_handedness and idx < len(result.multi_handedness):
                 hand_label = result.multi_handedness[idx].classification[0].label
-            pointers.append(HandPointer(point=point, label=hand_label))
+            pointers.append(HandPointer(point=point, label=f"{hand_label} pinch"))
             landmarks.append(hand_lm)
 
         return HandTrackerResult(pointers=pointers, raw_landmarks=landmarks)
@@ -87,3 +91,27 @@ class MediaPipeHandTracker:
 
     def close(self) -> None:
         self._hands.close()
+
+    def _pinch_point_if_active(self, hand_lm: object, inf_w: int, inf_h: int) -> Point2D | None:
+        thumb_tip = hand_lm.landmark[self._mp_hands.HandLandmark.THUMB_TIP]
+        index_tip = hand_lm.landmark[self._mp_hands.HandLandmark.INDEX_FINGER_TIP]
+        index_mcp = hand_lm.landmark[self._mp_hands.HandLandmark.INDEX_FINGER_MCP]
+        pinky_mcp = hand_lm.landmark[self._mp_hands.HandLandmark.PINKY_MCP]
+
+        thumb_x = float(thumb_tip.x) * inf_w
+        thumb_y = float(thumb_tip.y) * inf_h
+        index_x = float(index_tip.x) * inf_w
+        index_y = float(index_tip.y) * inf_h
+        index_mcp_x = float(index_mcp.x) * inf_w
+        index_mcp_y = float(index_mcp.y) * inf_h
+        pinky_mcp_x = float(pinky_mcp.x) * inf_w
+        pinky_mcp_y = float(pinky_mcp.y) * inf_h
+
+        pinch_distance = math.hypot(index_x - thumb_x, index_y - thumb_y)
+        palm_width = math.hypot(index_mcp_x - pinky_mcp_x, index_mcp_y - pinky_mcp_y)
+        threshold = max(6.0, palm_width * self._config.pinch_threshold_ratio)
+
+        if pinch_distance > threshold:
+            return None
+
+        return Point2D(x=int((thumb_x + index_x) * 0.5), y=int((thumb_y + index_y) * 0.5))
