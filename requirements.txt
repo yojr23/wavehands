@@ -1,0 +1,6 @@
+mediapipe==0.10.21
+opencv-python==4.11.0.86
+numpy==1.26.4
+sounddevice==0.5.5
+mingus==0.6.1
+midiutil==1.2.1
