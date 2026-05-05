@@ -11,8 +11,12 @@ from wavehands.domain.models import Point2D
 @dataclass(frozen=True)
 class WheelPalette:
     outline: tuple[int, int, int] = (90, 90, 90)
+    base_fill: tuple[int, int, int] = (40, 60, 80)
+    base_alpha: float = 0.28
     selected_fill: tuple[int, int, int] = (0, 185, 255)
+    selected_alpha: float = 0.68
     hover_fill: tuple[int, int, int] = (70, 140, 180)
+    hover_alpha: float = 0.48
     segment_border: tuple[int, int, int] = (200, 200, 200)
     text: tuple[int, int, int] = (250, 250, 250)
     pointer_ring: tuple[int, int, int] = (0, 130, 220)
@@ -38,6 +42,17 @@ class NoteWheel:
         self._sector_deg = 360.0 / max(1, len(self.note_names))
         self._segment_angles: list[tuple[float, float]] = []
         self._text_positions: list[tuple[int, int]] = []
+        self._rebuild_geometry_cache()
+
+    def set_note_names(self, note_names: Sequence[str]) -> None:
+        names = list(note_names)
+        if not names:
+            names = ["--"]
+        if names == self.note_names:
+            return
+        self.note_names = names
+        self._sector_size = (2 * math.pi) / max(1, len(self.note_names))
+        self._sector_deg = 360.0 / max(1, len(self.note_names))
         self._rebuild_geometry_cache()
 
     def set_geometry(self, center: Point2D, radius: int) -> None:
@@ -70,20 +85,25 @@ class NoteWheel:
     ) -> None:
         sectors = len(self.note_names)
         outline_color = self.palette.outline
-        text_scale = max(0.35, min(0.7, self.radius / 170.0))
+        density_scale = min(1.0, 8.0 / max(1.0, float(sectors)))
+        text_scale = max(0.28, min(0.7, self.radius / 170.0) * density_scale)
         text_thick = 2 if text_scale >= 0.55 else 1
+
+        # Base translucida para separar visualmente el wheel del fondo de camara.
+        self._blend_circle(frame, self.palette.base_fill, self.palette.base_alpha)
 
         for idx, note in enumerate(self.note_names):
             start, end = self._segment_angles[idx]
             color = outline_color
-            thickness = 2
-
+            thickness = 1
             if selected_index == idx:
                 color = self.palette.selected_fill
-                thickness = -1
+                self._blend_sector(frame, start, end, color, self.palette.selected_alpha)
+                thickness = 2
             elif hovered_index == idx:
                 color = self.palette.hover_fill
-                thickness = -1
+                self._blend_sector(frame, start, end, color, self.palette.hover_alpha)
+                thickness = 2
 
             cv2.ellipse(
                 frame,
@@ -96,7 +116,18 @@ class NoteWheel:
                 thickness,
             )
 
-            if selected_index == idx or hovered_index == idx:
+            if selected_index == idx:
+                cv2.ellipse(
+                    frame,
+                    (self.center.x, self.center.y),
+                    (self.radius, self.radius),
+                    0.0,
+                    start,
+                    end,
+                    self.palette.segment_border,
+                    1,
+                )
+            elif hovered_index == idx:
                 cv2.ellipse(
                     frame,
                     (self.center.x, self.center.y),
@@ -109,7 +140,11 @@ class NoteWheel:
                 )
 
             tx, ty = self._text_positions[idx]
-            cv2.putText(frame, note, (tx - 14, ty + 5), cv2.FONT_HERSHEY_SIMPLEX, text_scale, self.palette.text, text_thick)
+            (text_w, text_h), _ = cv2.getTextSize(note, cv2.FONT_HERSHEY_SIMPLEX, text_scale, text_thick)
+            text_x = tx - (text_w // 2)
+            text_y = ty + (text_h // 2)
+            cv2.putText(frame, note, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, text_scale, (16, 16, 16), text_thick + 2)
+            cv2.putText(frame, note, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, text_scale, self.palette.text, text_thick)
 
         cv2.circle(frame, (self.center.x, self.center.y), self.radius + 2, self.palette.segment_border, 2)
 
@@ -134,6 +169,38 @@ class NoteWheel:
             self.palette.hold_text,
             1,
         )
+
+    def _blend_circle(self, frame: np.ndarray, color: tuple[int, int, int], alpha: float) -> None:
+        alpha = max(0.0, min(1.0, alpha))
+        if alpha <= 0.0:
+            return
+        overlay = frame.copy()
+        cv2.circle(overlay, (self.center.x, self.center.y), self.radius, color, -1)
+        cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0.0, frame)
+
+    def _blend_sector(
+        self,
+        frame: np.ndarray,
+        start: float,
+        end: float,
+        color: tuple[int, int, int],
+        alpha: float,
+    ) -> None:
+        alpha = max(0.0, min(1.0, alpha))
+        if alpha <= 0.0:
+            return
+        overlay = frame.copy()
+        cv2.ellipse(
+            overlay,
+            (self.center.x, self.center.y),
+            (self.radius, self.radius),
+            0.0,
+            start,
+            end,
+            color,
+            -1,
+        )
+        cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0.0, frame)
 
     def _rebuild_geometry_cache(self) -> None:
         sectors = len(self.note_names)

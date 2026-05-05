@@ -1,8 +1,7 @@
-import ctypes
 import queue
+import threading
 import time
 import wave
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -13,51 +12,55 @@ from wavehands.config import AudioConfig
 from wavehands.infrastructure.audio.c_voice_mixer import CVoiceMixer
 
 
-@dataclass
-class _LoopVoice:
-    frequency_hz: float
-    duration_samples: int
-    velocity: float
-    phase: float = 0.0
-    elapsed_samples: int = 0
-
-
 class MonoSynthEngine:
     def __init__(self, config: AudioConfig) -> None:
         self._config = config
         self._sample_rate = config.sample_rate
-        self._phase = 0.0
 
         self._target_freq = 261.63
-        self._current_freq = 261.63
         self._target_amp = 0.0
-        self._current_amp = 0.0
         self._volume = 0.5
+        self._instrument_name = "Sine"
         self._note_off_at: Optional[float] = None
+        self._note_off_at_perf: Optional[float] = None
         self._is_active = False
-        self._loop_voices: list[_LoopVoice] = []
+
         self._c_mixer = CVoiceMixer()
-        self._chord_intervals: tuple[int, ...] = (0,)
-        self._chord_phases: list[float] = []
-        self._harmonic_ratios: tuple[float, ...] = ()
-        self._harmonic_phases_np = np.zeros(0, dtype=np.float64)
-        self._harmonic_ratios_np = np.zeros(0, dtype=np.float64)
         self._root_mix = 0.58
         self._harmonic_mix = 1.05
+
+        # Persistent state scalars as 1-element arrays to avoid per-callback ctypes objects.
+        self._state_freq = np.asarray([261.63], dtype=np.float32)
+        self._state_amp = np.asarray([0.0], dtype=np.float32)
+        self._state_phase = np.asarray([0.0], dtype=np.float32)
+
+        self._harmonic_ratios_np = np.zeros(0, dtype=np.float32)
+        self._harmonic_phases_np = np.zeros(0, dtype=np.float32)
+
         self._callback_count = 0
         self._xrun_count = 0
         self._callback_cpu_avg = 0.0
+
         self._output_buffer = np.zeros(max(1, config.block_size), dtype=np.float32)
-        self._loop_freqs = np.zeros(0, dtype=np.float64)
-        self._loop_phases = np.zeros(0, dtype=np.float64)
-        self._loop_elapsed = np.zeros(0, dtype=np.int32)
-        self._loop_durations = np.zeros(0, dtype=np.int32)
-        self._loop_velocities = np.zeros(0, dtype=np.float64)
-        self._note_off_at_perf: Optional[float] = None
+
+        self._loop_voice_count = 0
+        self._loop_freqs = np.zeros(8, dtype=np.float32)
+        self._loop_phases = np.zeros(8, dtype=np.float32)
+        self._loop_elapsed = np.zeros(8, dtype=np.int32)
+        self._loop_durations = np.zeros(8, dtype=np.int32)
+        self._loop_velocities = np.zeros(8, dtype=np.float32)
+
         self._control_queue: queue.SimpleQueue[tuple[str, tuple]] = queue.SimpleQueue()
         self._record_capture_active = False
         self._record_capture_paused = False
         self._record_chunks: list[np.ndarray] = []
+        self._record_lock = threading.Lock()
+
+        self._freq_lerp = 0.0025
+        self._amp_attack_lerp = self._seconds_to_lerp(config.attack_seconds)
+        self._amp_release_lerp = self._seconds_to_lerp(config.release_seconds)
+        self._attack_samples = int(0.008 * self._sample_rate)
+        self._release_samples = int(0.055 * self._sample_rate)
 
         self._stream = sd.OutputStream(
             channels=1,
@@ -69,12 +72,11 @@ class MonoSynthEngine:
         )
         self._stream.start()
 
-        self._freq_lerp = 0.0025
-        self._amp_attack_lerp = self._seconds_to_lerp(config.attack_seconds)
-        self._amp_release_lerp = self._seconds_to_lerp(config.release_seconds)
-
     def set_volume(self, volume: float) -> None:
         self._control_queue.put(("set_volume", (max(0.0, min(1.0, volume)),)))
+
+    def set_instrument(self, instrument_name: str) -> None:
+        self._control_queue.put(("set_instrument", (str(instrument_name),)))
 
     def trigger_note(
         self,
@@ -116,26 +118,32 @@ class MonoSynthEngine:
         self._stream.close()
 
     def start_record_capture(self) -> None:
-        self._record_chunks = []
-        self._record_capture_paused = False
-        self._record_capture_active = True
+        with self._record_lock:
+            self._record_chunks = []
+            self._record_capture_paused = False
+            self._record_capture_active = True
 
     def pause_record_capture(self) -> None:
-        if self._record_capture_active:
-            self._record_capture_paused = True
+        with self._record_lock:
+            if self._record_capture_active:
+                self._record_capture_paused = True
 
     def resume_record_capture(self) -> None:
-        if self._record_capture_active:
-            self._record_capture_paused = False
+        with self._record_lock:
+            if self._record_capture_active:
+                self._record_capture_paused = False
 
     def stop_record_capture(self, wav_path: Path) -> bool:
-        self._record_capture_active = False
-        self._record_capture_paused = False
-        if not self._record_chunks:
+        with self._record_lock:
+            self._record_capture_active = False
+            self._record_capture_paused = False
+            chunks = self._record_chunks
+            self._record_chunks = []
+        if not chunks:
             return False
 
         try:
-            audio = np.concatenate(self._record_chunks, axis=0)
+            audio = np.concatenate(chunks, axis=0)
             np.clip(audio, -1.0, 1.0, out=audio)
             pcm = (audio * 32767.0).astype(np.int16)
             wav_path.parent.mkdir(parents=True, exist_ok=True)
@@ -146,14 +154,14 @@ class MonoSynthEngine:
                 wav_file.writeframes(pcm.tobytes())
             return True
         finally:
-            self._record_chunks = []
+            chunks.clear()
 
     def metrics_snapshot(self) -> dict[str, float]:
         return {
             "callback_count": float(self._callback_count),
             "xrun_count": float(self._xrun_count),
             "callback_cpu_avg": float(self._callback_cpu_avg),
-            "loop_voice_count": float(len(self._loop_voices)),
+            "loop_voice_count": float(self._loop_voice_count),
         }
 
     def _seconds_to_lerp(self, seconds: float) -> float:
@@ -175,77 +183,47 @@ class MonoSynthEngine:
             self._note_off_at = None
             self._note_off_at_perf = None
 
-        target_freq = self._target_freq
-        target_amp = self._target_amp
-        volume = self._volume
-        chord_phases = list(self._chord_phases)
-        harmonic_ratios_np = self._harmonic_ratios_np
-        loop_voices = self._loop_voices
-
-        self._ensure_audio_buffers(frames, len(loop_voices))
+        self._ensure_output_buffer(frames)
         output = self._output_buffer[:frames]
         output.fill(0.0)
 
-        attack_samples = int(0.008 * self._sample_rate)
-        release_samples = int(0.055 * self._sample_rate)
+        harmonic_count = int(self._harmonic_phases_np.shape[0])
 
-        harmonic_count = len(chord_phases)
-        if harmonic_count > 0:
-            self._harmonic_phases_np[:harmonic_count] = np.asarray(chord_phases, dtype=np.float64)
-            harmonics_phase_ptr = self._harmonic_phases_np
-            harmonics_ratio_ptr = harmonic_ratios_np
-        else:
-            harmonics_phase_ptr = None
-            harmonics_ratio_ptr = None
-
-        if self._c_mixer.available:
-            current_freq = ctypes.c_double(self._current_freq)
-            current_amp = ctypes.c_double(self._current_amp)
-            main_phase = ctypes.c_double(self._phase)
-            self._current_freq, self._current_amp, self._phase = self._c_mixer.mix_main_voice(
+        use_c_main_mixer = self._c_mixer.available and self._instrument_name == "Sine"
+        if use_c_main_mixer:
+            self._c_mixer.mix_main_voice(
                 frames=frames,
                 sample_rate=self._sample_rate,
-                target_freq=target_freq,
-                target_amp=target_amp,
-                volume=volume,
+                target_freq=self._target_freq,
+                target_amp=self._target_amp,
+                volume=self._volume,
                 master_gain=self._config.master_gain,
                 freq_lerp=self._freq_lerp,
                 amp_attack_lerp=self._amp_attack_lerp,
                 amp_release_lerp=self._amp_release_lerp,
                 root_mix=self._root_mix,
                 harmonic_mix=self._harmonic_mix,
-                current_freq=current_freq,
-                current_amp=current_amp,
-                main_phase=main_phase,
+                current_freq=self._state_freq,
+                current_amp=self._state_amp,
+                main_phase=self._state_phase,
                 harmonic_count=harmonic_count,
-                harmonic_ratios=harmonics_ratio_ptr,
-                harmonic_phases=harmonics_phase_ptr,
+                harmonic_ratios=self._harmonic_ratios_np if harmonic_count > 0 else None,
+                harmonic_phases=self._harmonic_phases_np if harmonic_count > 0 else None,
                 out_buffer=output,
             )
-            if harmonic_count > 0:
-                chord_phases = self._harmonic_phases_np[:harmonic_count].tolist()
         else:
             self._mix_main_voice_python(
                 output=output,
                 frames=frames,
-                target_freq=target_freq,
-                target_amp=target_amp,
-                volume=volume,
-                chord_phases=chord_phases,
-                harmonic_count=harmonic_count,
+                target_freq=self._target_freq,
+                target_amp=self._target_amp,
+                volume=self._volume,
+                instrument=self._instrument_name,
             )
 
-        # Loop voices are mixed by C helper when available (fallback to Python).
-        if loop_voices:
+        if self._loop_voice_count > 0:
             if self._c_mixer.available:
-                voice_count = len(loop_voices)
-                for idx, voice in enumerate(loop_voices):
-                    self._loop_freqs[idx] = voice.frequency_hz
-                    self._loop_phases[idx] = voice.phase
-                    self._loop_elapsed[idx] = voice.elapsed_samples
-                    self._loop_durations[idx] = voice.duration_samples
-                    self._loop_velocities[idx] = voice.velocity
-
+                voice_count = self._loop_voice_count
                 self._c_mixer.mix(
                     frequencies=self._loop_freqs[:voice_count],
                     phases=self._loop_phases[:voice_count],
@@ -254,51 +232,18 @@ class MonoSynthEngine:
                     velocities=self._loop_velocities[:voice_count],
                     frames=frames,
                     sample_rate=self._sample_rate,
-                    volume=volume,
+                    volume=self._volume,
                     master_gain=self._config.master_gain,
-                    attack_samples=attack_samples,
-                    release_samples=release_samples,
+                    attack_samples=self._attack_samples,
+                    release_samples=self._release_samples,
                     out_buffer=output,
                 )
-
-                alive_voices: list[_LoopVoice] = []
-                for idx, voice in enumerate(loop_voices):
-                    voice.phase = float(self._loop_phases[idx])
-                    voice.elapsed_samples = int(self._loop_elapsed[idx])
-                    if voice.elapsed_samples < voice.duration_samples:
-                        alive_voices.append(voice)
-                loop_voices = alive_voices
             else:
-                sr = float(self._sample_rate)
-                loop_output = np.zeros(frames, dtype=np.float32)
-                alive_voices: list[_LoopVoice] = []
-                for voice in loop_voices:
-                    if voice.elapsed_samples >= voice.duration_samples:
-                        continue
-                    for i in range(frames):
-                        if voice.elapsed_samples >= voice.duration_samples:
-                            break
-                        remaining = voice.duration_samples - voice.elapsed_samples
-                        if attack_samples > 0 and voice.elapsed_samples < attack_samples:
-                            envelope = voice.elapsed_samples / float(max(1, attack_samples))
-                        elif release_samples > 0 and remaining < release_samples:
-                            envelope = remaining / float(max(1, release_samples))
-                        else:
-                            envelope = 1.0
-                        loop_output[i] += np.sin(2.0 * np.pi * voice.phase) * envelope * voice.velocity * volume * self._config.master_gain
-                        voice.phase += voice.frequency_hz / sr
-                        if voice.phase >= 1.0:
-                            voice.phase -= 1.0
-                        voice.elapsed_samples += 1
-                    if voice.elapsed_samples < voice.duration_samples:
-                        alive_voices.append(voice)
-                output += loop_output
-                loop_voices = alive_voices
+                self._mix_loop_voices_python(output=output, frames=frames, volume=self._volume)
+            self._compact_loop_voices()
 
         np.tanh(output, out=output)
 
-        self._loop_voices = loop_voices
-        self._chord_phases = chord_phases
         cb_elapsed = time.perf_counter() - cb_start
         buffer_seconds = frames / float(self._sample_rate)
         cpu_ratio = cb_elapsed / max(buffer_seconds, 1e-6)
@@ -306,17 +251,67 @@ class MonoSynthEngine:
 
         outdata[:, 0] = output
         if self._record_capture_active and not self._record_capture_paused:
-            self._record_chunks.append(np.copy(output))
+            chunk = output.copy()
+            with self._record_lock:
+                if self._record_capture_active and not self._record_capture_paused:
+                    self._record_chunks.append(chunk)
 
-    def _ensure_audio_buffers(self, frames: int, voices: int) -> None:
+    def _ensure_output_buffer(self, frames: int) -> None:
         if self._output_buffer.shape[0] < frames:
             self._output_buffer = np.zeros(frames, dtype=np.float32)
-        if self._loop_freqs.shape[0] < voices:
-            self._loop_freqs = np.zeros(voices, dtype=np.float64)
-            self._loop_phases = np.zeros(voices, dtype=np.float64)
-            self._loop_elapsed = np.zeros(voices, dtype=np.int32)
-            self._loop_durations = np.zeros(voices, dtype=np.int32)
-            self._loop_velocities = np.zeros(voices, dtype=np.float64)
+
+    def _ensure_loop_capacity(self, required: int) -> None:
+        if required <= self._loop_freqs.shape[0]:
+            return
+
+        new_capacity = max(required, self._loop_freqs.shape[0] * 2, 8)
+
+        next_freqs = np.zeros(new_capacity, dtype=np.float32)
+        next_phases = np.zeros(new_capacity, dtype=np.float32)
+        next_elapsed = np.zeros(new_capacity, dtype=np.int32)
+        next_durations = np.zeros(new_capacity, dtype=np.int32)
+        next_velocities = np.zeros(new_capacity, dtype=np.float32)
+
+        count = self._loop_voice_count
+        next_freqs[:count] = self._loop_freqs[:count]
+        next_phases[:count] = self._loop_phases[:count]
+        next_elapsed[:count] = self._loop_elapsed[:count]
+        next_durations[:count] = self._loop_durations[:count]
+        next_velocities[:count] = self._loop_velocities[:count]
+
+        self._loop_freqs = next_freqs
+        self._loop_phases = next_phases
+        self._loop_elapsed = next_elapsed
+        self._loop_durations = next_durations
+        self._loop_velocities = next_velocities
+
+    def _append_loop_voice(self, frequency_hz: float, duration_samples: int, velocity: float) -> None:
+        index = self._loop_voice_count
+        self._ensure_loop_capacity(index + 1)
+        self._loop_freqs[index] = np.float32(frequency_hz)
+        self._loop_phases[index] = np.float32(0.0)
+        self._loop_elapsed[index] = np.int32(0)
+        self._loop_durations[index] = np.int32(duration_samples)
+        self._loop_velocities[index] = np.float32(velocity)
+        self._loop_voice_count = index + 1
+
+    def _compact_loop_voices(self) -> None:
+        count = self._loop_voice_count
+        if count == 0:
+            return
+
+        alive = 0
+        for idx in range(count):
+            if self._loop_elapsed[idx] >= self._loop_durations[idx]:
+                continue
+            if alive != idx:
+                self._loop_freqs[alive] = self._loop_freqs[idx]
+                self._loop_phases[alive] = self._loop_phases[idx]
+                self._loop_elapsed[alive] = self._loop_elapsed[idx]
+                self._loop_durations[alive] = self._loop_durations[idx]
+                self._loop_velocities[alive] = self._loop_velocities[idx]
+            alive += 1
+        self._loop_voice_count = alive
 
     def _mix_main_voice_python(
         self,
@@ -325,40 +320,90 @@ class MonoSynthEngine:
         target_freq: float,
         target_amp: float,
         volume: float,
-        chord_phases: list[float],
-        harmonic_count: int,
+        instrument: str,
     ) -> None:
         sr = float(self._sample_rate)
-        root_gain = self._root_mix if harmonic_count > 0 else 1.0
-        harmonic_gain = self._harmonic_mix / harmonic_count if harmonic_count > 0 else 0.0
-        for i in range(frames):
-            self._current_freq += (target_freq - self._current_freq) * self._freq_lerp
-            amp_lerp = self._amp_attack_lerp if target_amp > self._current_amp else self._amp_release_lerp
-            self._current_amp += (target_amp - self._current_amp) * amp_lerp
+        root_gain = self._root_mix if self._harmonic_phases_np.size > 0 else 1.0
+        harmonic_gain = self._harmonic_mix / max(1, self._harmonic_phases_np.size)
 
-            root = np.sin(2.0 * np.pi * self._phase) * self._current_amp * volume * self._config.master_gain * root_gain
-            self._phase += self._current_freq / sr
-            if self._phase >= 1.0:
-                self._phase -= 1.0
+        current_freq = float(self._state_freq[0])
+        current_amp = float(self._state_amp[0])
+        phase = float(self._state_phase[0])
+        attack_lerp = self._amp_attack_lerp
+        release_lerp = self._amp_release_lerp
+        if instrument == "Piano":
+            attack_lerp = min(1.0, attack_lerp * 1.8)
+            release_lerp = min(1.0, release_lerp * 1.2)
+
+        for i in range(frames):
+            current_freq += (target_freq - current_freq) * self._freq_lerp
+            amp_lerp = attack_lerp if target_amp > current_amp else release_lerp
+            current_amp += (target_amp - current_amp) * amp_lerp
+
+            root = np.sin(2.0 * np.pi * phase) * current_amp * volume * self._config.master_gain * root_gain
+            phase += current_freq / sr
+            if phase >= 1.0:
+                phase -= 1.0
 
             harmonic_mix = 0.0
-            if harmonic_count > 0:
-                for h_idx in range(harmonic_count):
-                    freq = self._current_freq * self._harmonic_ratios[h_idx]
-                    bright_boost = 1.08 if self._harmonic_ratios[h_idx] > 1.8 else 1.0
+            if self._harmonic_phases_np.size > 0:
+                for h_idx in range(self._harmonic_phases_np.size):
+                    ratio = float(self._harmonic_ratios_np[h_idx])
+                    bright_boost = 1.08 if ratio > 1.8 else 1.0
                     harmonic_mix += (
-                        np.sin(2.0 * np.pi * chord_phases[h_idx])
-                        * self._current_amp
+                        np.sin(2.0 * np.pi * float(self._harmonic_phases_np[h_idx]))
+                        * current_amp
                         * volume
                         * self._config.master_gain
                         * harmonic_gain
                         * bright_boost
                     )
-                    chord_phases[h_idx] += freq / sr
-                    if chord_phases[h_idx] >= 1.0:
-                        chord_phases[h_idx] -= 1.0
+                    self._harmonic_phases_np[h_idx] += np.float32((current_freq * ratio) / sr)
+                    if self._harmonic_phases_np[h_idx] >= 1.0:
+                        self._harmonic_phases_np[h_idx] -= np.float32(1.0)
 
-            output[i] += root + harmonic_mix
+            sample = root + harmonic_mix
+            if instrument == "Piano":
+                second = np.sin(2.0 * np.pi * ((phase * 2.0) % 1.0)) * current_amp * volume * self._config.master_gain * 0.24
+                third = np.sin(2.0 * np.pi * ((phase * 3.0) % 1.0)) * current_amp * volume * self._config.master_gain * 0.14
+                sample = (sample * 0.88) + second + third
+            output[i] += sample
+
+        self._state_freq[0] = np.float32(current_freq)
+        self._state_amp[0] = np.float32(current_amp)
+        self._state_phase[0] = np.float32(phase)
+
+    def _mix_loop_voices_python(self, output: np.ndarray, frames: int, volume: float) -> None:
+        sr = float(self._sample_rate)
+        for voice_idx in range(self._loop_voice_count):
+            elapsed = int(self._loop_elapsed[voice_idx])
+            duration = int(self._loop_durations[voice_idx])
+            if elapsed >= duration:
+                continue
+
+            phase = float(self._loop_phases[voice_idx])
+            freq = float(self._loop_freqs[voice_idx])
+            velocity = float(self._loop_velocities[voice_idx])
+
+            for sample_idx in range(frames):
+                if elapsed >= duration:
+                    break
+                remaining = duration - elapsed
+                if self._attack_samples > 0 and elapsed < self._attack_samples:
+                    envelope = elapsed / float(max(1, self._attack_samples))
+                elif self._release_samples > 0 and remaining < self._release_samples:
+                    envelope = remaining / float(max(1, self._release_samples))
+                else:
+                    envelope = 1.0
+
+                output[sample_idx] += np.sin(2.0 * np.pi * phase) * envelope * velocity * volume * self._config.master_gain
+                phase += freq / sr
+                if phase >= 1.0:
+                    phase -= 1.0
+                elapsed += 1
+
+            self._loop_phases[voice_idx] = np.float32(phase)
+            self._loop_elapsed[voice_idx] = np.int32(elapsed)
 
     def _apply_pending_commands(self) -> None:
         while True:
@@ -371,6 +416,19 @@ class MonoSynthEngine:
                 self._volume = float(payload[0])
                 continue
 
+            if cmd == "set_instrument":
+                name = str(payload[0]).strip() if payload else "Sine"
+                if name not in ("Sine", "Piano", "Drums"):
+                    name = "Sine"
+                self._instrument_name = name
+                self._target_amp = 0.0
+                self._is_active = False
+                self._note_off_at = None
+                self._note_off_at_perf = None
+                self._harmonic_ratios_np = np.zeros(0, dtype=np.float32)
+                self._harmonic_phases_np = np.zeros(0, dtype=np.float32)
+                continue
+
             if cmd == "stop_note":
                 self._target_amp = 0.0
                 self._is_active = False
@@ -380,38 +438,65 @@ class MonoSynthEngine:
 
             if cmd == "trigger_note":
                 frequency_hz, duration_seconds, sustain, chord_intervals = payload
+                if self._instrument_name == "Drums":
+                    base_freq = float(frequency_hz)
+                    if base_freq < 220.0:
+                        drum_freq = 72.0
+                        drum_duration = 0.24
+                        drum_velocity = 1.0
+                    elif base_freq < 440.0:
+                        drum_freq = 182.0
+                        drum_duration = 0.16
+                        drum_velocity = 0.9
+                    else:
+                        drum_freq = 620.0
+                        drum_duration = 0.08
+                        drum_velocity = 0.7
+                    self._append_loop_voice(
+                        frequency_hz=drum_freq,
+                        duration_samples=max(1, int(drum_duration * self._sample_rate)),
+                        velocity=max(0.0, min(1.0, drum_velocity)),
+                    )
+                    self._target_amp = 0.0
+                    self._is_active = False
+                    self._note_off_at = None
+                    self._note_off_at_perf = None
+                    self._harmonic_ratios_np = np.zeros(0, dtype=np.float32)
+                    self._harmonic_phases_np = np.zeros(0, dtype=np.float32)
+                    continue
+
                 now = time.time()
                 self._target_freq = float(frequency_hz)
                 self._is_active = True
                 self._target_amp = self._volume
                 self._note_off_at = None if sustain else now + float(duration_seconds)
                 self._note_off_at_perf = None if sustain else time.perf_counter() + float(duration_seconds)
-                self._chord_intervals = tuple(chord_intervals)
-                harmonics = max(0, len(self._chord_intervals) - 1)
-                base_ratios = [float(np.power(2.0, interval / 12.0)) for interval in self._chord_intervals[1:]]
-                detuned_ratios: list[float] = []
-                for idx, ratio in enumerate(base_ratios):
+
+                harmonics = max(0, len(tuple(chord_intervals)) - 1)
+                if harmonics == 0:
+                    self._harmonic_ratios_np = np.zeros(0, dtype=np.float32)
+                    self._harmonic_phases_np = np.zeros(0, dtype=np.float32)
+                    continue
+
+                detuned = np.zeros(harmonics, dtype=np.float32)
+                for idx, interval in enumerate(tuple(chord_intervals)[1:]):
+                    ratio = float(np.power(2.0, float(interval) / 12.0))
                     cents = 4.0 if idx % 2 == 0 else -4.0
                     detune = float(np.power(2.0, cents / 1200.0))
-                    detuned_ratios.append(ratio * detune)
-                self._harmonic_ratios = tuple(detuned_ratios)
-                if harmonics != len(self._chord_phases):
-                    self._chord_phases = [0.0 for _ in range(harmonics)]
-                    self._harmonic_phases_np = np.zeros(harmonics, dtype=np.float64)
-                    self._harmonic_ratios_np = (
-                        np.asarray(self._harmonic_ratios, dtype=np.float64) if harmonics > 0 else np.zeros(0, dtype=np.float64)
-                    )
-                elif harmonics > 0:
-                    self._harmonic_ratios_np[:] = np.asarray(self._harmonic_ratios, dtype=np.float64)
+                    detuned[idx] = np.float32(ratio * detune)
+
+                if self._harmonic_phases_np.shape[0] != harmonics:
+                    self._harmonic_phases_np = np.zeros(harmonics, dtype=np.float32)
+                    self._harmonic_ratios_np = detuned
+                else:
+                    self._harmonic_ratios_np[:] = detuned
                 continue
 
             if cmd == "trigger_loop_note":
                 frequency_hz, duration_seconds, velocity = payload
                 duration_samples = max(1, int(float(duration_seconds) * self._sample_rate))
-                self._loop_voices.append(
-                    _LoopVoice(
-                        frequency_hz=float(frequency_hz),
-                        duration_samples=duration_samples,
-                        velocity=float(velocity),
-                    )
+                self._append_loop_voice(
+                    frequency_hz=float(frequency_hz),
+                    duration_samples=duration_samples,
+                    velocity=float(velocity),
                 )

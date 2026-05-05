@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 
 from wavehands.domain.models import PerformanceSettings
+from wavehands.domain.notes import ACCIDENTAL_OPTIONS, ROOT_NOTE_OPTIONS, SCALE_NAMES
 
 
 @dataclass
@@ -86,14 +87,69 @@ class OptionSelector:
 
 
 @dataclass
+class CycleSelector:
+    label: str
+    x: int
+    y: int
+    width: int
+    height: int
+    options: List[str]
+    selected_index: int = 0
+
+    def contains(self, px: int, py: int) -> bool:
+        return self.x <= px <= self.x + self.width and self.y <= py <= self.y + self.height
+
+    def on_click(self, px: int, py: int) -> bool:
+        if not self.contains(px, py) or len(self.options) <= 1:
+            return False
+        arrow_w = min(28, self.width // 4)
+        if px <= self.x + arrow_w:
+            self.selected_index = (self.selected_index - 1) % len(self.options)
+            return True
+        if px >= self.x + self.width - arrow_w:
+            self.selected_index = (self.selected_index + 1) % len(self.options)
+            return True
+        return False
+
+    def selected_value(self) -> str:
+        return self.options[self.selected_index]
+
+    def draw(self, frame: np.ndarray) -> None:
+        label_y = self.y + 12
+        row_y = self.y + 18
+        cv2.putText(frame, self.label, (self.x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (236, 242, 249), 1)
+        cv2.rectangle(frame, (self.x, row_y), (self.x + self.width, row_y + self.height), (56, 71, 89), -1)
+        cv2.rectangle(frame, (self.x, row_y), (self.x + self.width, row_y + self.height), (129, 148, 173), 1)
+
+        arrow_w = min(28, self.width // 4)
+        left_center = (self.x + arrow_w // 2, row_y + (self.height // 2))
+        right_center = (self.x + self.width - arrow_w // 2, row_y + (self.height // 2))
+        cv2.putText(frame, "<", (left_center[0] - 5, left_center[1] + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (243, 249, 255), 1)
+        cv2.putText(frame, ">", (right_center[0] - 5, right_center[1] + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (243, 249, 255), 1)
+
+        value = self.selected_value()
+        (text_w, _), _ = cv2.getTextSize(value, cv2.FONT_HERSHEY_SIMPLEX, 0.46, 1)
+        text_x = self.x + (self.width - text_w) // 2
+        text_y = row_y + int(self.height * 0.68)
+        cv2.putText(frame, value, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (243, 249, 255), 1)
+
+    def set_geometry(self, x: int, y: int, width: int, height: int) -> None:
+        self.x = x
+        self.y = y
+        self.width = max(120, width)
+        self.height = max(20, height)
+
+
+@dataclass
 class ToggleControl:
     label: str
     x: int
     y: int
+    width: int = 180
     checked: bool = False
 
     def contains(self, px: int, py: int) -> bool:
-        return self.x <= px <= self.x + 180 and self.y <= py <= self.y + 24
+        return self.x <= px <= self.x + self.width and self.y <= py <= self.y + 24
 
     def toggle(self) -> None:
         self.checked = not self.checked
@@ -104,9 +160,11 @@ class ToggleControl:
         cv2.rectangle(frame, (self.x, self.y), (self.x + 20, self.y + 20), (129, 148, 173), 1)
         cv2.putText(frame, self.label, (self.x + 28, self.y + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (236, 242, 249), 1)
 
-    def set_geometry(self, x: int, y: int) -> None:
+    def set_geometry(self, x: int, y: int, width: Optional[int] = None) -> None:
         self.x = x
         self.y = y
+        if width is not None:
+            self.width = max(80, width)
 
 
 @dataclass
@@ -175,16 +233,60 @@ class ControlPanel:
             options=["-1", "0", "+1", "+2"],
             selected_index=1,
         )
+        self.root_selector = CycleSelector(
+            label="Tonica",
+            x=content_x,
+            y=272,
+            width=slider_width,
+            height=24,
+            options=list(ROOT_NOTE_OPTIONS),
+            selected_index=0,
+        )
+        self.scale_selector = CycleSelector(
+            label="Escala",
+            x=content_x,
+            y=316,
+            width=slider_width,
+            height=24,
+            options=list(SCALE_NAMES),
+            selected_index=0,
+        )
+        self.accidental_selector = CycleSelector(
+            label="Alteraciones",
+            x=content_x,
+            y=360,
+            width=slider_width,
+            height=24,
+            options=list(ACCIDENTAL_OPTIONS),
+            selected_index=0,
+        )
+        self.instrument_selector = CycleSelector(
+            label="Instrumento",
+            x=content_x,
+            y=404,
+            width=slider_width,
+            height=24,
+            options=["Sine", "Piano", "Drums"],
+            selected_index=0,
+        )
         self.sustain_toggle = ToggleControl(
             label="Sustain",
             x=content_x,
-            y=300,
+            y=444,
+            width=120,
             checked=False,
+        )
+        self.camera_toggle = ToggleControl(
+            label="Camara ON",
+            x=content_x + 128,
+            y=444,
+            width=150,
+            checked=True,
         )
         self.record_toggle_button = ActionButton(
             label="Grabar",
             x=content_x,
-            y=338,
+            y=480,
             width=150,
             height=30,
             fill_color=(17, 132, 81),
@@ -192,7 +294,7 @@ class ControlPanel:
         self.record_stop_button = ActionButton(
             label="Detener",
             x=content_x + 160,
-            y=338,
+            y=480,
             width=120,
             height=30,
             fill_color=(173, 61, 61),
@@ -210,6 +312,11 @@ class ControlPanel:
             note_duration_seconds=self.duration_slider.value,
             octave_shift=octave_shift,
             sustain=self.sustain_toggle.checked,
+            root_note=self.root_selector.selected_value(),
+            scale_name=self.scale_selector.selected_value(),
+            accidental_mode=self.accidental_selector.selected_value(),
+            instrument_name=self.instrument_selector.selected_value(),
+            show_camera=self.camera_toggle.checked,
         )
 
     def on_mouse(self, event: int, x: int, y: int, _flags: int, _param: object) -> None:
@@ -227,8 +334,20 @@ class ControlPanel:
                 return
             if self.range_selector.on_click(x, y):
                 return
+            if self.root_selector.on_click(x, y):
+                return
+            if self.scale_selector.on_click(x, y):
+                return
+            if self.accidental_selector.on_click(x, y):
+                return
+            if self.instrument_selector.on_click(x, y):
+                return
             if self.sustain_toggle.contains(x, y):
                 self.sustain_toggle.toggle()
+                return
+            if self.camera_toggle.contains(x, y):
+                self.camera_toggle.toggle()
+                self.camera_toggle.label = "Camara ON" if self.camera_toggle.checked else "Camara OFF"
                 return
             if self.record_toggle_button.contains(x, y):
                 self.record_toggle_button.click()
@@ -250,17 +369,30 @@ class ControlPanel:
     def layout(self, panel_x: int, panel_width: int, canvas_height: int) -> None:
         content_x = panel_x + 16
         content_w = max(120, panel_width - 32)
-        y = 74
-        gap = max(10, canvas_height // 36)
+        y = 62
+        gap = max(4, canvas_height // 96)
 
         self.volume_slider.set_geometry(content_x, y, content_w)
         y += 40 + gap
         self.duration_slider.set_geometry(content_x, y, content_w)
         y += 40 + gap
         self.range_selector.set_geometry(content_x, y, content_w, 30)
-        y += 56 + gap
-        self.sustain_toggle.set_geometry(content_x, y)
-        y += 36 + gap
+        y += 52 + gap
+        self.root_selector.set_geometry(content_x, y, content_w, 24)
+        y += 44 + gap
+        self.scale_selector.set_geometry(content_x, y, content_w, 24)
+        y += 44 + gap
+        self.accidental_selector.set_geometry(content_x, y, content_w, 24)
+        y += 44 + gap
+        self.instrument_selector.set_geometry(content_x, y, content_w, 24)
+        y += 42 + gap
+
+        toggle_gap = 10
+        toggle_w = max(90, (content_w - toggle_gap) // 2)
+        self.sustain_toggle.set_geometry(content_x, y, toggle_w)
+        self.camera_toggle.set_geometry(content_x + toggle_w + toggle_gap, y, toggle_w)
+        y += 30 + gap
+
         left_w = max(96, int(content_w * 0.56))
         right_w = max(84, content_w - left_w - 10)
         self.record_toggle_button.set_geometry(content_x, y, left_w, 30)
@@ -274,7 +406,12 @@ class ControlPanel:
         self.volume_slider.draw(frame)
         self.duration_slider.draw(frame)
         self.range_selector.draw(frame)
+        self.root_selector.draw(frame)
+        self.scale_selector.draw(frame)
+        self.accidental_selector.draw(frame)
+        self.instrument_selector.draw(frame)
         self.sustain_toggle.draw(frame)
+        self.camera_toggle.draw(frame)
         self.record_toggle_button.draw(frame)
         self.record_stop_button.draw(frame)
 

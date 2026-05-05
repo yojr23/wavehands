@@ -29,4 +29,8 @@ class PerformanceSettings:
     note_duration_seconds: float = 0.6
     octave_shift: int = 0
     sustain: bool = False
-
+    root_note: str = "Do"
+    scale_name: str = "Mayor"
+    accidental_mode: str = "Sostenidos (#)"
+    instrument_name: str = "Sine"
+    show_camera: bool = True

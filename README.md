@@ -4,8 +4,9 @@ Sintetizador monofonico controlado con manos usando MediaPipe y OpenCV.
 
 ## Objetivo de esta version
 
-- Seleccionar notas con la mano en un circulo de 7 notas: `Do, Re, Mi, Fa, Sol, La, Si`.
+- Seleccionar notas con la mano en un circulo dinamico de escala (mayor, menor, pentatonicas, blues, cromatica).
 - Configurar `volumen`, `longitud` y `rango` con mouse.
+- Elegir `tonica`, `alteraciones (#/b)` e `instrumento` (`Sine`, `Piano`, `Drums`).
 - Reproduccion de audio en tiempo real (seno) con `sounddevice`.
 - Pedal virtual de sustain por gesto (mantiene nota aunque retires la mano).
 - Loop station por gesto: grabar, reproducir en bucle y overdub.
@@ -50,6 +51,9 @@ python app.py
 - Con `Sustain` apagado, la nota dura lo definido por `Longitud`.
 - Con `Sustain` encendido, la nota se mantiene hasta cambiar de nota.
 - El circulo de acordes/subnotas modifica el color armonico del sonido en tiempo real.
+- Selector `Camara ON/OFF`:
+  - `ON`: salida de camara completa.
+  - `OFF`: fondo neutro con overlays de deteccion de manos.
 - `Sustain` se controla por checkbox en el panel derecho.
 - Grabacion de video en panel derecho:
   - `Grabar` inicia

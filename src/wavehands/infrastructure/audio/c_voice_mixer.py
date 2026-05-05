@@ -38,11 +38,11 @@ class CVoiceMixer:
 
         self._lib.mix_loop_voices(
             ctypes.c_int(voice_count),
-            frequencies.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-            phases.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            frequencies.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            phases.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             elapsed.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
             durations.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
-            velocities.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            velocities.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             ctypes.c_int(frames),
             ctypes.c_int(sample_rate),
             ctypes.c_float(volume),
@@ -65,47 +65,46 @@ class CVoiceMixer:
         amp_release_lerp: float,
         root_mix: float,
         harmonic_mix: float,
-        current_freq: ctypes.c_double,
-        current_amp: ctypes.c_double,
-        main_phase: ctypes.c_double,
+        current_freq: np.ndarray,
+        current_amp: np.ndarray,
+        main_phase: np.ndarray,
         harmonic_count: int,
         harmonic_ratios: Optional[np.ndarray],
         harmonic_phases: Optional[np.ndarray],
         out_buffer: np.ndarray,
-    ) -> tuple[float, float, float]:
+    ) -> None:
         if not self._lib:
-            return float(current_freq.value), float(current_amp.value), float(main_phase.value)
+            return
 
         if harmonic_count > 0:
             if harmonic_ratios is None or harmonic_phases is None:
-                return float(current_freq.value), float(current_amp.value), float(main_phase.value)
-            ratios_ptr = harmonic_ratios.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
-            phases_ptr = harmonic_phases.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+                return
+            ratios_ptr = harmonic_ratios.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+            phases_ptr = harmonic_phases.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
         else:
-            ratios_ptr = ctypes.POINTER(ctypes.c_double)()
-            phases_ptr = ctypes.POINTER(ctypes.c_double)()
+            ratios_ptr = ctypes.POINTER(ctypes.c_float)()
+            phases_ptr = ctypes.POINTER(ctypes.c_float)()
 
         self._lib.mix_main_voice(
             ctypes.c_int(frames),
             ctypes.c_int(sample_rate),
-            ctypes.c_double(target_freq),
-            ctypes.c_double(target_amp),
-            ctypes.c_double(volume),
-            ctypes.c_double(master_gain),
-            ctypes.c_double(freq_lerp),
-            ctypes.c_double(amp_attack_lerp),
-            ctypes.c_double(amp_release_lerp),
-            ctypes.c_double(root_mix),
-            ctypes.c_double(harmonic_mix),
-            ctypes.byref(current_freq),
-            ctypes.byref(current_amp),
-            ctypes.byref(main_phase),
+            ctypes.c_float(target_freq),
+            ctypes.c_float(target_amp),
+            ctypes.c_float(volume),
+            ctypes.c_float(master_gain),
+            ctypes.c_float(freq_lerp),
+            ctypes.c_float(amp_attack_lerp),
+            ctypes.c_float(amp_release_lerp),
+            ctypes.c_float(root_mix),
+            ctypes.c_float(harmonic_mix),
+            current_freq.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            current_amp.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            main_phase.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             ctypes.c_int(harmonic_count),
             ratios_ptr,
             phases_ptr,
             out_buffer.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         )
-        return float(current_freq.value), float(current_amp.value), float(main_phase.value)
 
     def _configure_signatures(self) -> None:
         if not self._lib:
@@ -113,32 +112,32 @@ class CVoiceMixer:
         self._lib.mix_main_voice.argtypes = [
             ctypes.c_int,
             ctypes.c_int,
-            ctypes.c_double,
-            ctypes.c_double,
-            ctypes.c_double,
-            ctypes.c_double,
-            ctypes.c_double,
-            ctypes.c_double,
-            ctypes.c_double,
-            ctypes.c_double,
-            ctypes.c_double,
-            ctypes.POINTER(ctypes.c_double),
-            ctypes.POINTER(ctypes.c_double),
-            ctypes.POINTER(ctypes.c_double),
+            ctypes.c_float,
+            ctypes.c_float,
+            ctypes.c_float,
+            ctypes.c_float,
+            ctypes.c_float,
+            ctypes.c_float,
+            ctypes.c_float,
+            ctypes.c_float,
+            ctypes.c_float,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_float),
             ctypes.c_int,
-            ctypes.POINTER(ctypes.c_double),
-            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_float),
             ctypes.POINTER(ctypes.c_float),
         ]
         self._lib.mix_main_voice.restype = None
 
         self._lib.mix_loop_voices.argtypes = [
             ctypes.c_int,
-            ctypes.POINTER(ctypes.c_double),
-            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_float),
             ctypes.POINTER(ctypes.c_int),
             ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_float),
             ctypes.c_int,
             ctypes.c_int,
             ctypes.c_float,
