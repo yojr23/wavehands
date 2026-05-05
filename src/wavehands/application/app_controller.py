@@ -41,6 +41,7 @@ from wavehands.utils.metrics import RuntimeMetrics, configure_logging
 class _TrackedFrame:
     frame: np.ndarray
     pointers: list[HandPointer]
+    raw_landmarks: list[object]
     source_w: int
     source_h: int
 
@@ -137,6 +138,9 @@ class WaveHandsApp:
         self._pending_save_temp_path: Optional[Path] = None
         self._pending_save_audio_path: Optional[Path] = None
         self.metrics = RuntimeMetrics(interval_seconds=self.config.metrics.log_interval_seconds)
+        self._show_camera_output = True
+        self._neutral_background_signature: Optional[tuple[int, int]] = None
+        self._neutral_background: Optional[np.ndarray] = None
         self._pipeline_stop = threading.Event()
         self._capture_queue: Queue[Optional[np.ndarray]] = Queue(maxsize=2)
         self._tracked_queue: Queue[Optional[_TrackedFrame]] = Queue(maxsize=2)
@@ -159,6 +163,7 @@ class WaveHandsApp:
         self._start_pipeline()
         last_frame = np.zeros((self.base_frame_h, self.base_frame_w, 3), dtype=np.uint8)
         last_pointers: list[HandPointer] = []
+        last_raw_landmarks: list[object] = []
         try:
             while True:
                 self._frame_counter += 1
@@ -172,6 +177,7 @@ class WaveHandsApp:
                 if tracked is not None:
                     source_frame = tracked.frame
                     source_pointers = tracked.pointers
+                    source_raw_landmarks = tracked.raw_landmarks
                     source_w = tracked.source_w
                     source_h = tracked.source_h
                     self.metrics.tick_frame(has_hands=bool(source_pointers))
@@ -180,6 +186,7 @@ class WaveHandsApp:
                         break
                     source_frame = last_frame
                     source_pointers = last_pointers
+                    source_raw_landmarks = last_raw_landmarks
                     source_h, source_w = source_frame.shape[:2]
 
                 if source_frame.shape[1] != camera_w or source_frame.shape[0] != camera_h:
@@ -196,6 +203,7 @@ class WaveHandsApp:
                 )
                 last_frame = camera_frame
                 last_pointers = pointers
+                last_raw_landmarks = source_raw_landmarks
 
                 layout_signature = (camera_w, camera_h, panel_w)
                 if self._last_layout_signature != layout_signature:
@@ -209,11 +217,12 @@ class WaveHandsApp:
 
                 now = time.time()
                 settings = self.controls.to_settings()
+                self._show_camera_output = settings.show_camera
                 volume_revision = self.controls.volume_revision
                 if volume_revision != self._last_volume_revision:
                     self._last_volume_revision = volume_revision
                     self.synth.set_volume(settings.volume)
-                self._apply_performance_context(settings)
+                performance_context_changed = self._apply_performance_context(settings)
                 self._poll_record_finalize()
                 record_toggle_requested = self.controls.consume_record_toggle()
                 record_stop_requested = self.controls.consume_record_stop()
@@ -255,6 +264,30 @@ class WaveHandsApp:
                     self.metrics.counters.note_changes += 1
 
                 selected_note_index = self.note_selector.state.selected_index
+                if (
+                    performance_context_changed
+                    and selected_note_index is not None
+                    and not note_selection_result.just_selected
+                ):
+                    frequency_hz = note_frequency_from_scale_index(
+                        selected_note_index,
+                        active_scale=self._active_scale,
+                        octave_shift=settings.octave_shift,
+                    )
+                    self.synth.trigger_note(
+                        frequency_hz=frequency_hz,
+                        duration_seconds=settings.note_duration_seconds,
+                        sustain=settings.sustain,
+                        chord_intervals=chord_intervals,
+                    )
+                    self._last_trigger_signature = (
+                        selected_note_index,
+                        settings.octave_shift,
+                        selected_chord_index if selected_chord_index is not None else -1,
+                        settings.sustain,
+                    )
+                    self._note_pulse_started_at = now
+
                 if (
                     chord_selection_result.just_selected
                     and selected_note_index is not None
@@ -319,11 +352,13 @@ class WaveHandsApp:
                 chord_hover_progress = self._hover_progress(self.chord_selector, now)
                 canvas = self._ensure_canvas()
                 canvas.fill(0)
-                frame = camera_frame
-                if not settings.show_camera:
-                    frame = self._build_neutral_camera_background(camera_w=camera_w, camera_h=camera_h)
-                    self._draw_pointer_overlay(frame=frame, pointers=pointers)
-                canvas[:, :camera_w] = frame
+                if settings.show_camera:
+                    canvas[:, :camera_w] = camera_frame
+                else:
+                    canvas_view = canvas[:, :camera_w]
+                    canvas_view[:] = self._build_neutral_camera_background(camera_w=camera_w, camera_h=camera_h)
+                    self.tracker.draw_landmarks_overlay(canvas_view, source_raw_landmarks)
+                    self._draw_pointer_overlay(frame=canvas_view, pointers=pointers)
 
                 pointer_inside_note_wheel = candidate_note_index is not None
                 self.note_wheel.draw(
@@ -380,6 +415,8 @@ class WaveHandsApp:
                     frequency_hz=selected_freq,
                     hands_detected=len(pointers),
                     interaction_mode=interaction_mode,
+                    selected_scale=f"{settings.root_note} {settings.scale_name}",
+                    selected_instrument=settings.instrument_name,
                     sustain_enabled=settings.sustain,
                     loop_mode=self.loop_station.state.mode,
                     loop_layers=len(self.loop_station.state.layers),
@@ -461,10 +498,12 @@ class WaveHandsApp:
                 return
 
             tracker_result = self.tracker.detect(frame)
-            self.tracker.draw(frame, tracker_result)
+            if self._show_camera_output:
+                self.tracker.draw(frame, tracker_result)
             tracked = _TrackedFrame(
                 frame=frame,
                 pointers=tracker_result.pointers,
+                raw_landmarks=tracker_result.raw_landmarks,
                 source_w=frame.shape[1],
                 source_h=frame.shape[0],
             )
@@ -545,7 +584,8 @@ class WaveHandsApp:
 
         return active_pointer
 
-    def _apply_performance_context(self, settings: PerformanceSettings) -> None:
+    def _apply_performance_context(self, settings: PerformanceSettings) -> bool:
+        changed = False
         scale_signature = (
             settings.root_note,
             settings.scale_name,
@@ -566,11 +606,15 @@ class WaveHandsApp:
             self.note_selector.state.hovered_index = None
             self.note_selector.state.stable_frames = 0
             self._last_trigger_signature = None
+            changed = True
 
         if settings.instrument_name != self._active_instrument_name:
             self._active_instrument_name = settings.instrument_name
             self.synth.set_instrument(settings.instrument_name)
             self._last_trigger_signature = None
+            changed = True
+
+        return changed
 
     def _hover_progress(self, selector: HoverSelectionService, now: float) -> float:
         if selector.state.hovered_index is None:
@@ -587,6 +631,10 @@ class WaveHandsApp:
         return 1.0 - (age / 0.4)
 
     def _build_neutral_camera_background(self, camera_w: int, camera_h: int) -> np.ndarray:
+        signature = (camera_w, camera_h)
+        if self._neutral_background is not None and self._neutral_background_signature == signature:
+            return self._neutral_background
+
         background = np.zeros((camera_h, camera_w, 3), dtype=np.uint8)
         background[:] = (26, 30, 36)
         for y in range(0, camera_h, 36):
@@ -595,6 +643,9 @@ class WaveHandsApp:
             cv2.line(background, (x, 0), (x, camera_h), (31, 36, 44), 1)
         cv2.putText(background, "Modo sin camara", (20, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (220, 230, 240), 2)
         cv2.putText(background, "Solo overlays de deteccion", (20, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (180, 190, 206), 1)
+
+        self._neutral_background = background
+        self._neutral_background_signature = signature
         return background
 
     def _draw_pointer_overlay(self, frame: np.ndarray, pointers: list[HandPointer]) -> None:
@@ -889,11 +940,14 @@ class WaveHandsApp:
         if self._record_frame_queue is None:
             return
         payload = frame
+        requires_copy = True
         if self._record_frame_size is not None:
             rw, rh = self._record_frame_size
             if frame.shape[1] != rw or frame.shape[0] != rh:
                 payload = cv2.resize(frame, (rw, rh), interpolation=cv2.INTER_LINEAR)
-        payload = payload.copy()
+                requires_copy = False
+        if requires_copy:
+            payload = payload.copy()
         try:
             self._record_frame_queue.put_nowait(payload)
             return

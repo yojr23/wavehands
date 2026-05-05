@@ -2,6 +2,13 @@
 
 Sintetizador monofonico controlado con manos usando MediaPipe y OpenCV.
 
+## Documentacion
+
+- Guia tecnica (arquitectura, logica, flujo de datos, rendimiento):
+  - [docs/technical-architecture.md](docs/technical-architecture.md)
+- Guia musical y de producto (escalas, instrumentos, features actuales y roadmap):
+  - [docs/music-instruments-and-features.md](docs/music-instruments-and-features.md)
+
 ## Objetivo de esta version
 
 - Seleccionar notas con la mano en un circulo dinamico de escala (mayor, menor, pentatonicas, blues, cromatica).

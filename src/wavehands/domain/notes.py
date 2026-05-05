@@ -93,6 +93,10 @@ def build_active_scale(root_note: str, scale_name: str, accidental_mode: str) ->
     )
 
 
+def build_scale(root_note: str, scale_name: str, accidental_mode: str = ACCIDENTAL_OPTIONS[0]) -> ActiveScale:
+    return build_active_scale(root_note=root_note, scale_name=scale_name, accidental_mode=accidental_mode)
+
+
 def note_name_from_scale_index(index: int, active_scale: ActiveScale) -> str:
     return active_scale.note_names[index % len(active_scale.note_names)]
 

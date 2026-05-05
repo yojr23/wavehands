@@ -50,6 +50,7 @@ class MediaPipeHandTracker:
         scale_x = out_w / float(inf_w)
         scale_y = out_h / float(inf_h)
         for idx, hand_lm in enumerate(result.multi_hand_landmarks):
+            landmarks.append(hand_lm)
             pinch_point = self._pinch_point_if_active(hand_lm, inf_w=inf_w, inf_h=inf_h)
             if pinch_point is None:
                 continue
@@ -62,32 +63,34 @@ class MediaPipeHandTracker:
             if result.multi_handedness and idx < len(result.multi_handedness):
                 hand_label = result.multi_handedness[idx].classification[0].label
             pointers.append(HandPointer(point=point, label=f"{hand_label} pinch"))
-            landmarks.append(hand_lm)
 
         return HandTrackerResult(pointers=pointers, raw_landmarks=landmarks)
 
     def draw(self, frame_bgr: np.ndarray, tracker_result: HandTrackerResult) -> None:
-        for idx, hand_lm in enumerate(tracker_result.raw_landmarks):
-            if self._config.draw_landmarks:
-                self._mp_draw.draw_landmarks(
-                    frame_bgr,
-                    hand_lm,
-                    self._mp_hands.HAND_CONNECTIONS,
-                    self._mp_styles.get_default_hand_landmarks_style(),
-                    self._mp_styles.get_default_hand_connections_style(),
-                )
-            if idx < len(tracker_result.pointers):
-                pointer = tracker_result.pointers[idx]
-                cv2.circle(frame_bgr, (pointer.point.x, pointer.point.y), 7, (0, 255, 255), -1)
-                cv2.putText(
-                    frame_bgr,
-                    pointer.label,
-                    (pointer.point.x + 9, pointer.point.y - 9),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.42,
-                    (255, 255, 255),
-                    1,
-                )
+        self.draw_landmarks_overlay(frame_bgr, tracker_result.raw_landmarks)
+        for pointer in tracker_result.pointers:
+            cv2.circle(frame_bgr, (pointer.point.x, pointer.point.y), 7, (0, 255, 255), -1)
+            cv2.putText(
+                frame_bgr,
+                pointer.label,
+                (pointer.point.x + 9, pointer.point.y - 9),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                (255, 255, 255),
+                1,
+            )
+
+    def draw_landmarks_overlay(self, frame_bgr: np.ndarray, raw_landmarks: List[object]) -> None:
+        if not raw_landmarks:
+            return
+        for hand_lm in raw_landmarks:
+            self._mp_draw.draw_landmarks(
+                frame_bgr,
+                hand_lm,
+                self._mp_hands.HAND_CONNECTIONS,
+                self._mp_styles.get_default_hand_landmarks_style(),
+                self._mp_styles.get_default_hand_connections_style(),
+            )
 
     def close(self) -> None:
         self._hands.close()

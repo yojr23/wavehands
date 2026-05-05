@@ -17,6 +17,7 @@ class SliderControl:
     min_value: float
     max_value: float
     value: float
+    display_mode: str = "raw"
 
     @property
     def track_y(self) -> int:
@@ -31,16 +32,52 @@ class SliderControl:
         self.value = self.min_value + ratio * (self.max_value - self.min_value)
 
     def draw(self, frame: np.ndarray) -> None:
-        cv2.putText(frame, self.label, (self.x, self.y + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (236, 242, 249), 1)
+        value_label = self._formatted_value(self.value)
+        cv2.putText(
+            frame,
+            f"{self.label}: {value_label}",
+            (self.x, self.y + 14),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (236, 242, 249),
+            1,
+        )
         cv2.line(frame, (self.x, self.track_y), (self.x + self.width, self.track_y), (75, 92, 114), 2)
         ratio = (self.value - self.min_value) / (self.max_value - self.min_value)
         knob_x = int(self.x + ratio * self.width)
         cv2.circle(frame, (knob_x, self.track_y), 8, (0, 190, 255), -1)
+        cv2.putText(
+            frame,
+            self._formatted_value(self.min_value),
+            (self.x, self.track_y + 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.37,
+            (164, 182, 204),
+            1,
+        )
+        max_text = self._formatted_value(self.max_value)
+        (max_w, _), _ = cv2.getTextSize(max_text, cv2.FONT_HERSHEY_SIMPLEX, 0.37, 1)
+        cv2.putText(
+            frame,
+            max_text,
+            (self.x + self.width - max_w, self.track_y + 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.37,
+            (164, 182, 204),
+            1,
+        )
 
     def set_geometry(self, x: int, y: int, width: int) -> None:
         self.x = x
         self.y = y
         self.width = max(80, width)
+
+    def _formatted_value(self, value: float) -> str:
+        if self.display_mode == "percent":
+            return f"{int(round(value * 100.0))}%"
+        if self.display_mode == "seconds":
+            return f"{value:.2f}s"
+        return f"{value:.2f}"
 
 
 @dataclass
@@ -97,7 +134,8 @@ class CycleSelector:
     selected_index: int = 0
 
     def contains(self, px: int, py: int) -> bool:
-        return self.x <= px <= self.x + self.width and self.y <= py <= self.y + self.height
+        row_y = self.y + 18
+        return self.x <= px <= self.x + self.width and row_y <= py <= row_y + self.height
 
     def on_click(self, px: int, py: int) -> bool:
         if not self.contains(px, py) or len(self.options) <= 1:
@@ -214,6 +252,7 @@ class ControlPanel:
             min_value=0.0,
             max_value=1.0,
             value=0.5,
+            display_mode="percent",
         )
         self.duration_slider = SliderControl(
             label="Longitud (seg)",
@@ -223,6 +262,7 @@ class ControlPanel:
             min_value=0.1,
             max_value=2.0,
             value=0.6,
+            display_mode="seconds",
         )
         self.range_selector = OptionSelector(
             label="Rango Octava",
@@ -266,7 +306,7 @@ class ControlPanel:
             y=404,
             width=slider_width,
             height=24,
-            options=["Sine", "Piano", "Drums"],
+            options=["Sine", "Piano", "Drums", "VST"],
             selected_index=0,
         )
         self.sustain_toggle = ToggleControl(

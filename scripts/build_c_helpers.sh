@@ -6,12 +6,18 @@ OUT_DIR="$ROOT_DIR/build"
 mkdir -p "$OUT_DIR"
 
 UNAME="$(uname -s)"
+SRC_FILE=""
+if [[ -f "$ROOT_DIR/c_src/voice_mixer.cpp" ]]; then
+  SRC_FILE="$ROOT_DIR/c_src/voice_mixer.cpp"
+else
+  SRC_FILE="$ROOT_DIR/c_src/voice_mixer.c"
+fi
 if [[ "$UNAME" == "Darwin" ]]; then
   OUT_FILE="$OUT_DIR/libvoice_mixer.dylib"
-  cc -O3 -std=c11 -dynamiclib "$ROOT_DIR/c_src/voice_mixer.c" -o "$OUT_FILE"
+  c++ -O3 -std=c++17 -dynamiclib "$SRC_FILE" -o "$OUT_FILE"
 else
   OUT_FILE="$OUT_DIR/libvoice_mixer.so"
-  cc -O3 -std=c11 -fPIC -shared "$ROOT_DIR/c_src/voice_mixer.c" -o "$OUT_FILE"
+  c++ -O3 -std=c++17 -fPIC -shared "$SRC_FILE" -o "$OUT_FILE"
 fi
 
 echo "Built $OUT_FILE"

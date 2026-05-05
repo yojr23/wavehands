@@ -189,8 +189,9 @@ class MonoSynthEngine:
 
         harmonic_count = int(self._harmonic_phases_np.shape[0])
 
-        use_c_main_mixer = self._c_mixer.available and self._instrument_name == "Sine"
+        use_c_main_mixer = self._c_mixer.available and self._instrument_name in ("Sine", "Piano")
         if use_c_main_mixer:
+            instrument_id = 0 if self._instrument_name == "Sine" else 1
             self._c_mixer.mix_main_voice(
                 frames=frames,
                 sample_rate=self._sample_rate,
@@ -206,6 +207,7 @@ class MonoSynthEngine:
                 current_freq=self._state_freq,
                 current_amp=self._state_amp,
                 main_phase=self._state_phase,
+                instrument_type=instrument_id,
                 harmonic_count=harmonic_count,
                 harmonic_ratios=self._harmonic_ratios_np if harmonic_count > 0 else None,
                 harmonic_phases=self._harmonic_phases_np if harmonic_count > 0 else None,

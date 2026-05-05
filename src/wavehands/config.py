@@ -33,6 +33,7 @@ class AudioConfig:
     master_gain: float = 0.3
     attack_seconds: float = 0.01
     release_seconds: float = 0.035
+    vst_plugin_path: str = ""
 
 
 @dataclass(frozen=True)
