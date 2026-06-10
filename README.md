@@ -1,77 +1,51 @@
-# WaveHands MVP
+# WaveHands
 
-Sintetizador monofonico controlado con manos usando MediaPipe y OpenCV.
+Gesture-controlled music performance system built with Python, MediaPipe, OpenCV, and low-latency audio synthesis.
 
-## Documentacion
+<p>
+  <img src="https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/MediaPipe-Hand%20Tracking-009688?style=flat-square&logo=google&logoColor=white" alt="MediaPipe">
+  <img src="https://img.shields.io/badge/OpenCV-Real--time%20Vision-5C3EE8?style=flat-square&logo=opencv&logoColor=white" alt="OpenCV">
+  <img src="https://img.shields.io/badge/Audio-Low%20Latency-f5a623?style=flat-square" alt="Low latency audio">
+  <img src="https://img.shields.io/badge/C%20DSP-Optional%20Acceleration-4dccbd?style=flat-square" alt="C DSP">
+</p>
 
-- Guia tecnica (arquitectura, logica, flujo de datos, rendimiento):
-  - [docs/technical-architecture.md](docs/technical-architecture.md)
-- Guia musical y de producto (escalas, instrumentos, features actuales y roadmap):
-  - [docs/music-instruments-and-features.md](docs/music-instruments-and-features.md)
+## Overview
 
-## Objetivo de esta version
+WaveHands turns hand movement into musical performance. It tracks the user's hand with a webcam, maps gestures to notes on a radial music interface, and synthesizes audio in real time. The project also includes sustain control, a gesture-driven loop station, selectable scales, and multiple instrument modes.
 
-- Seleccionar notas con la mano en un circulo dinamico de escala (mayor, menor, pentatonicas, blues, cromatica).
-- Configurar `volumen`, `longitud` y `rango` con mouse.
-- Elegir `tonica`, `alteraciones (#/b)` e `instrumento` (`Sine`, `Piano`, `Drums`).
-- Reproduccion de audio en tiempo real (seno) con `sounddevice`.
-- Pedal virtual de sustain por gesto (mantiene nota aunque retires la mano).
-- Loop station por gesto: grabar, reproducir en bucle y overdub.
+This is the kind of project that combines creative interaction design with real-time engineering constraints.
 
-## Requisitos
+## Why This Project Matters
 
-- Python `3.11.10` (fijado con `.python-version`)
-- Webcam
-- Salida de audio del sistema
+- It explores human-computer interaction through gesture-based control.
+- It mixes computer vision, audio synthesis, and interface rendering in one real-time application.
+- It shows how to structure a performance-oriented Python app with clear modular boundaries.
 
-## Instalacion
+## Core Features
 
-```bash
-pyenv local 3.11.10
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
+- Hand tracking with MediaPipe and OpenCV
+- Dynamic note wheel for scales such as major, minor, pentatonic, blues, and chromatic
+- Real-time monophonic synthesis with selectable instrument behavior
+- Sustain pedal behavior
+- Gesture-based loop station with recording, playback, and overdubbing
+- Responsive UI with camera mode and neutral-background mode
+- In-app video recording with optional FFmpeg muxing
+- Optional C helper for lower-latency voice mixing
 
-### Compilar helper C (recomendado para menor latencia)
+## Musical Interaction Model
 
-```bash
-./scripts/build_c_helpers.sh
-```
+WaveHands currently supports:
 
-## Ejecucion
+- Chromatic tonics with sharp or flat note naming
+- Major, natural minor, major pentatonic, minor pentatonic, blues, and chromatic scales
+- Instrument modes: `Sine`, `Piano`, and `Drums`
+- Note triggering through stable hover selection
+- Harmonic color changes through a secondary chord/subnote wheel
 
-```bash
-source .venv/bin/activate
-python app.py
-```
+## Runtime Architecture
 
-- Inicia en pantalla completa por defecto.
-- `f` alterna pantalla completa / ventana.
-
-- Salir con `ESC` o `q`.
-
-## Interaccion
-
-- Mueve la punta del indice sobre el circulo de notas.
-- Mantener `hover` ~0.5s selecciona la nota.
-- Con `Sustain` apagado, la nota dura lo definido por `Longitud`.
-- Con `Sustain` encendido, la nota se mantiene hasta cambiar de nota.
-- El circulo de acordes/subnotas modifica el color armonico del sonido en tiempo real.
-- Selector `Camara ON/OFF`:
-  - `ON`: salida de camara completa.
-  - `OFF`: fondo neutro con overlays de deteccion de manos.
-- `Sustain` se controla por checkbox en el panel derecho.
-- Grabacion de video en panel derecho:
-  - `Grabar` inicia
-  - `Pausar/Reanudar` alterna durante la toma
-  - `Detener` cierra la toma y abre un cuadro dentro de la app para escribir el nombre.
-- Exportacion con audio:
-  - Si `ffmpeg` esta instalado, se guarda un `.mp4` con audio integrado.
-  - Si `ffmpeg` no esta instalado, se guarda el `.mp4` de video y un `.wav` separado en `~/Downloads`.
-- La ventana ahora es responsive: puedes redimensionarla y la UI se adapta (con mapeo correcto de mouse).
-
-## Arquitectura
+The app is organized into a layered structure:
 
 ```text
 app.py
@@ -90,33 +64,86 @@ src/wavehands/
     audio/mono_synth.py
     audio/c_voice_mixer.py
   presentation/
-    note_wheel.py
-    gesture_pedals.py
     controls.py
+    gesture_pedals.py
+    note_wheel.py
     renderer.py
   config.py
 ```
 
-## Rendimiento
+### Main pipeline
 
-- Resolucion de proceso optimizada por defecto: `640x360`.
-- Inferencia de manos en ancho reducido (`256px`) para subir FPS.
-- Buffer de audio bajo: `64` muestras (latencia menor).
-- Mezcla de voces del loop acelerada en C (`c_src/voice_mixer.c`) con fallback Python.
-- Seleccion rapida de nota/acorde (`hover` corto y `cooldown` bajo).
+1. The camera thread reads frames from the webcam.
+2. The tracking layer detects hands and extracts pointer positions.
+3. The application layer resolves stable hover selection and loop-state changes.
+4. The audio engine maps the selection to frequency data and triggers sound output.
+5. The presentation layer renders the wheel, HUD, controls, and performance state.
 
-## Logs y metricas
+## Performance Notes
 
-El programa imprime metricas periodicas en terminal (cada ~2s):
+- Default processing resolution is optimized for responsiveness.
+- Audio runs through `sounddevice` with a low buffer size.
+- The loop voice mixer can use a compiled C helper for better performance.
+- The app reports runtime metrics such as FPS, hand-detection ratio, current note, audio callback rate, XRuns, and active voices.
 
-- `fps`
-- `% frames con manos detectadas`
-- `nota/acorde actuales`
-- `numero de cambios de nota/acorde`
-- `toggles de sustain` y cambios de loop
-- `audio_cb_rate`, `audio_xruns`, `audio_cpu` y `voices`
+## Requirements
 
-## Notas
+- Python `3.11.10`
+- Webcam
+- System audio output
+- `ffmpeg` if you want exported MP4 files with muxed audio
 
-- El MVP actual es monofonico por diseno.
-- `mingus` y `midiutil` estan instalados para la siguiente iteracion (acordes/grabacion MIDI).
+## Installation
+
+```bash
+pyenv local 3.11.10
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### Optional: compile the C helper
+
+```bash
+./scripts/build_c_helpers.sh
+```
+
+## Run the App
+
+```bash
+source .venv/bin/activate
+python app.py
+```
+
+Useful controls:
+
+- `f` toggles fullscreen mode
+- `q` or `ESC` exits the app
+
+## Technical Documentation
+
+- [Technical architecture](docs/technical-architecture.md)
+- [Music model, instruments, and feature roadmap](docs/music-instruments-and-features.md)
+
+## What This Project Demonstrates
+
+- Real-time application design under latency constraints
+- Gesture-driven interface design
+- Modular Python architecture across domain, application, infrastructure, and presentation layers
+- Practical integration of computer vision and audio synthesis
+- Performance-minded engineering with optional native acceleration
+
+## Current Limitations
+
+- The current MVP is monophonic by design
+- Rhythmic quantization is not implemented yet
+- Piano and drum synthesis can still be improved for realism
+- Some real-time orchestration logic remains concentrated in `app_controller.py`
+
+## Next Improvements
+
+- MIDI export
+- Visual and audio metronome
+- Quantized loop recording
+- Additional instruments and smarter chord behavior
+- More test coverage around real-time orchestration
